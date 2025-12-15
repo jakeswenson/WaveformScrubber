@@ -5,8 +5,11 @@
 //  Created by Luka Korica on 7/2/25.
 //
 
+import os
 import SwiftUI
 import AVFoundation
+
+private let logger = Logger(subsystem: "WaveformScrubber", category: "WaveformScrubber")
 
 /// A SwiftUI view that displays an audio waveform and allows seeking through playback.
 ///
@@ -16,12 +19,18 @@ public struct WaveformScrubber<Drawer: WaveformDrawing,
                                 ActiveStyle: ShapeStyle,
                                InactiveStyle: ShapeStyle>: View {
 
+    /// The source of waveform data - either a URL to load from, or pre-supplied samples.
+    enum DataSource: Equatable {
+        case url(URL)
+        case samples([Float])
+    }
+
     @Environment(\.waveformScrubberStyle) private var style
     private let waveformCacheService = WaveformCache.shared
 
     let config: ScrubberConfig<ActiveStyle, InactiveStyle>
     let drawer: Drawer
-    let url: URL
+    let dataSource: DataSource
 
     @Binding var progress: CGFloat
 
@@ -33,12 +42,34 @@ public struct WaveformScrubber<Drawer: WaveformDrawing,
     @State private var viewSize: CGSize = .zero
     @GestureState private var isDragging: Bool = false
 
-    private struct LoadTaskID: Equatable {
+    /// Task ID for triggering sample loading/processing.
+    /// For URL-based loading: includes size since we downsample based on view width.
+    /// For samples-based loading: excludes size to avoid cycles during geometry changes.
+    private var loadTaskID: AnyHashable {
+        switch dataSource {
+        case .url(let url):
+            return AnyHashable(URLTaskID(url: url, size: viewSize))
+        case .samples(let samples):
+            // Only depend on samples identity (by count + first/last), not size
+            // This prevents cycles when geometry changes during iOS navigation
+            return AnyHashable(SamplesTaskID(count: samples.count,
+                                             first: samples.first ?? 0,
+                                             last: samples.last ?? 0))
+        }
+    }
+
+    private struct URLTaskID: Hashable {
         let url: URL
         let size: CGSize
     }
 
-    /// Creates a new WaveformScrubber view.
+    private struct SamplesTaskID: Hashable {
+        let count: Int
+        let first: Float
+        let last: Float
+    }
+
+    /// Creates a new WaveformScrubber view that loads waveform data from a URL.
     /// - Parameters:
     ///   - config: Configuration for the scrubbers's appearance.
     ///   - drawer: Type of a drawer used for the scrubber's instance
@@ -56,26 +87,65 @@ public struct WaveformScrubber<Drawer: WaveformDrawing,
     ) {
         self.config = config
         self.drawer = drawer
-        self.url = url
+        self.dataSource = .url(url)
         self._progress = progress
         self._localProgress = State(initialValue: progress.wrappedValue)
         self.onInfoLoaded = onInfoLoaded
         self.onGestureActive = onGestureActive
     }
 
+    /// Creates a new WaveformScrubber view with pre-supplied waveform samples.
+    ///
+    /// Use this initializer when you already have waveform data (e.g., from a streaming audio engine)
+    /// and want to avoid re-parsing the audio file.
+    ///
+    /// - Parameters:
+    ///   - config: Configuration for the scrubbers's appearance.
+    ///   - drawer: Type of a drawer used for the scrubber's instance
+    ///   - samples: Pre-computed waveform samples (normalized 0.0-1.0). These will be downsampled
+    ///              to fit the view width automatically.
+    ///   - progress: A binding to the playback progress, from 0.0 to 1.0.
+    ///   - onGestureActive: A closure called when the user starts or stops a drag gesture.
+    public init(
+        config: ScrubberConfig<ActiveStyle, InactiveStyle>,
+        drawer: Drawer,
+        samples: [Float],
+        progress: Binding<CGFloat>,
+        onGestureActive: @escaping (Bool) -> Void = { _ in }
+    ) {
+        self.config = config
+        self.drawer = drawer
+        self.dataSource = .samples(samples)
+        self._progress = progress
+        self._localProgress = State(initialValue: progress.wrappedValue)
+        self.onInfoLoaded = { _ in }
+        self.onGestureActive = onGestureActive
+    }
+
     public var body: some View {
         resolveStyleAndApplyModifiers()
-            .task(id: LoadTaskID(url: url, size: viewSize)) {
-                // TODO: Remove this debouncer
-                do {
-                    try await Task.sleep(nanoseconds: 50_000_000)
-                } catch {
+            .task(id: loadTaskID) {
+                logger.notice("[WAVEFORM] WaveformScrubber task triggered - viewSize: \(viewSize.width)x\(viewSize.height)")
+                guard viewSize.width > 0 else {
+                    logger.notice("[WAVEFORM] WaveformScrubber: viewSize.width is 0, waiting for layout")
                     return
                 }
 
-                guard viewSize.width > 0 else { return }
+                switch dataSource {
+                case .url(let url):
+                    logger.notice("[WAVEFORM] WaveformScrubber: loading from URL: \(url.lastPathComponent)")
+                    // Debounce URL-based loading
+                    do {
+                        try await Task.sleep(nanoseconds: 50_000_000)
+                    } catch {
+                        return
+                    }
+                    await loadAudioDataFromURL()
 
-                await loadAudioData()
+                case .samples(let rawSamples):
+                    logger.notice("[WAVEFORM] WaveformScrubber: using pre-supplied samples (\(rawSamples.count) samples)")
+                    await prepareSamplesForDisplay(rawSamples)
+                }
             }
     }
 
@@ -133,17 +203,44 @@ public struct WaveformScrubber<Drawer: WaveformDrawing,
         GeometryReader { geometry in
             Color.clear
                 .onAppear {
+                    // Only set viewSize once on appear to avoid cycles
+                    // during layout changes (especially iOS navigation)
                     if viewSize == .zero {
                         viewSize = geometry.size
                     }
                 }
-                .onChange(of: geometry.size) { newSize in
-                    viewSize = newSize
-                }
         }
     }
 
-    private func loadAudioData() async {
+    /// Prepares pre-supplied samples for display by downsampling to fit the view.
+    private func prepareSamplesForDisplay(_ rawSamples: [Float]) async {
+        guard !rawSamples.isEmpty else {
+            logger.notice("[WAVEFORM] WaveformScrubber.prepareSamplesForDisplay: rawSamples is EMPTY")
+            return
+        }
+
+        let targetSampleCount = drawer.sampleCount(for: viewSize)
+        logger.notice("[WAVEFORM] WaveformScrubber: downsampling \(rawSamples.count) -> \(targetSampleCount) samples for viewSize \(viewSize.width)")
+
+        if Task.isCancelled { return }
+
+        let preparedSamples = await AudioProcessor.prepareSamples(
+            samples: rawSamples,
+            to: targetSampleCount,
+            upsampleStrategy: drawer.upsampleStrategy
+        )
+
+        if Task.isCancelled { return }
+
+        logger.notice("[WAVEFORM] WaveformScrubber: prepared \(preparedSamples.count) samples for display")
+        await MainActor.run {
+            self.samples = preparedSamples
+        }
+    }
+
+    /// Loads waveform data from a URL.
+    private func loadAudioDataFromURL() async {
+        guard case .url(let url) = dataSource else { return }
         guard viewSize.width > 0 else { return }
 
         // Clear old samples to provide immediate visual feedback.
